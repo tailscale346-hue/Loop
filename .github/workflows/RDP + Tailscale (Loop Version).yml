@@ -1,0 +1,123 @@
+name: RDP + Tailscale (Loop Version)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (email)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin)"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      cycles:
+        description: "Number of cycles"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+      MAIN_RUNTIME_MIN: 300
+      BREAK_MIN: 20
+
+    steps:
+
+      - name: Show cycle count
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          "CYCLES_LEFT=$cycles" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Set hostname
+        run: |
+          "TS_HOSTNAME=bullet" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Install + Up Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+          }
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME"
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TS_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Enable RDP user + firewall
+        run: |
+          $u=$env:RDP_USER
+          $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Install Python libs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyautogui pynput pillow
+          python - << 'EOF'
+import pyautogui, pynput, PIL
+EOF
+
+      - name: 5-hour active period
+        run: |
+          $end = (Get-Date).AddMinutes($env:MAIN_RUNTIME_MIN)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+          }
+
+      - name: 20-minute break
+        if: env.CYCLES_LEFT != '1'
+        run: |
+          $end = (Get-Date).AddMinutes($env:BREAK_MIN)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Dispatch next cycle
+        if: env.CYCLES_LEFT != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $next = [int]$env:CYCLES_LEFT - 1
+          $payload = @{
+            ts_tailnet = "${{ inputs.ts_tailnet }}"
+            ts_api_key = "${{ inputs.ts_api_key }}"
+            ts_authkey = "${{ inputs.ts_authkey }}"
+            cycles     = "$next"
+          }
+          $body = @{
+            ref    = "${{ github.ref_name }}"
+            inputs = $payload
+          } | ConvertTo-Json -Depth 5
+          Invoke-WebRequest -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-loop.yml/dispatches" `
+            -Headers @{Authorization="Bearer $env:GH_TOKEN";Accept="application/vnd.github+json"} `
+            -Body $body
+
+      - name: All cycles complete
+        if: env.CYCLES_LEFT == '1'
+        run: |
+          Write-Host "Done"
+          
